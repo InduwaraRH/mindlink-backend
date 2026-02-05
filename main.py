@@ -7,6 +7,7 @@ from fastapi import FastAPI, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import numpy as np
+from fastapi.middleware.cors import CORSMiddleware
 
 # --- THESIS ARCHITECTURE IMPORTS ---
 from sklearn.linear_model import SGDClassifier
@@ -99,6 +100,14 @@ jitai_model.partial_fit(X_scaled, y_warmup, classes=[0, 1, 2, 3])
 print("✅ Model Trained & Ready for Online Learning.")
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
 # --- HELPER: GET 4D CONTEXT VECTOR ---
 def get_user_context(user_id: int, db: Session):
