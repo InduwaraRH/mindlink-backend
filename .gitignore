@@ -1,0 +1,25 @@
+# --- Security & Secrets (Crucial) ---
+.env
+.env.local
+.env.*
+secrets.json
+
+# --- Python Virtual Environments ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- Python Cache & Compiled Files ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- IDE Settings (Optional but Recommended) ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- Local Databases ---
+*.sqlite3
+*.db
