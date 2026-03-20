@@ -40,7 +40,7 @@ from database import engine, get_db
 def get_local_hour() -> int:
     if TZ_OFFSET_HOURS == 0:
         return datetime.now().hour  # Local dev — uses PC system time
-    tz = timezone(timedelta(hours=TZ_OFFSET_HOURS))
+    tz = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(tz).hour
 
 # ─────────────────────────────────────────────────────────────────────────────
