@@ -29,19 +29,10 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 
-
 import models
 import schemas
 from database import engine, get_db
-# Timezone offset in hours from UTC
-# Set TZ_OFFSET=5.5 in Render environment variables for Sri Lanka (UTC+5:30)
-# Defaults to 0 (UTC) — local dev already uses system time via datetime.now()
 
-def get_local_hour() -> int:
-    if TZ_OFFSET_HOURS == 0:
-        return datetime.now().hour  # Local dev — uses PC system time
-    tz = timezone(timedelta(hours=5, minutes=30))
-    return datetime.now(tz).hour
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -66,10 +57,21 @@ def _load_env_file(env_path: str) -> None:
 
 _load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TZ_OFFSET_HOURS = float(os.getenv("TZ_OFFSET", "0"))
 
 user_request_times = {}
 models.Base.metadata.create_all(bind=engine)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TIMEZONE — Sri Lanka Standard Time (UTC+5:30)
+# Hardcoded for production reliability on Render (which runs UTC).
+# datetime.now(SRI_LANKA_TZ) always returns correct Sri Lanka time
+# regardless of server location — no environment variable needed.
+# ─────────────────────────────────────────────────────────────────────────────
+SRI_LANKA_TZ = timezone(timedelta(hours=5, minutes=30))
+
+def get_local_hour() -> int:
+    return datetime.now(SRI_LANKA_TZ).hour
 
 
 # ─────────────────────────────────────────────────────────────────────────────
