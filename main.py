@@ -5,27 +5,13 @@ import requests
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
+import numpy as np
 
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
-import numpy as np
-
-# ─────────────────────────────────────────────────────────────────────────────
-# THESIS ARCHITECTURE IMPORTS
-#
-# RandomForestClassifier replaces SGDClassifier for two reasons:
-#   1. Non-linear decision boundaries — RF correctly prioritises low mood as a
-#      CRISIS signal even when competing features (e.g. high completion rate)
-#      pull a linear model toward a different class.
-#   2. Enables Option A (confidence gating) via predict_proba(), which SGD
-#      does not support reliably with small datasets.
-#
-# RC1 is implemented as batch retraining (fit on all accumulated examples)
-# rather than partial_fit(), because RF does not support incremental learning.
-# ─────────────────────────────────────────────────────────────────────────────
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 
@@ -64,11 +50,9 @@ models.Base.metadata.create_all(bind=engine)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TIMEZONE — Sri Lanka Standard Time (UTC+5:30)
-# Hardcoded for production reliability on Render (which runs UTC).
-# datetime.now(SRI_LANKA_TZ) always returns correct Sri Lanka time
-# regardless of server location — no environment variable needed.
 # ─────────────────────────────────────────────────────────────────────────────
 SRI_LANKA_TZ = timezone(timedelta(hours=5, minutes=30))
+
 
 def get_local_hour() -> int:
     return datetime.now(SRI_LANKA_TZ).hour
@@ -76,9 +60,6 @@ def get_local_hour() -> int:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PASSWORD HASHING — bcrypt
-#
-# Replaces the previous stub implementation (password + "notreallyhashed").
-# Uses bcrypt directly for secure password storage.
 # ─────────────────────────────────────────────────────────────────────────────
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -117,44 +98,362 @@ class Feedback(BaseModel):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OPTION A — CONFIDENCE GATE THRESHOLD
-#
-# Academic contribution: Standard RandomForestClassifier always outputs a
-# prediction, even when the ensemble is uncertain (e.g. 35% CRISIS, 33%
-# ACADEMIC, 32% NEUTRAL). Delivering an intervention based on a near-random
-# prediction is clinically unsafe.
-#
-# This threshold adds a confidence gate: if the model's maximum class
-# probability does not exceed CONFIDENCE_THRESHOLD, the system returns NEUTRAL
-# rather than acting on an unreliable prediction. This prevents low-confidence
-# predictions from triggering inappropriate interventions — a modification not
-# present in off-the-shelf RF implementations.
-#
-# CRISIS exception: The gate is deliberately lowered for CRISIS predictions.
-# Clinical safety requires erring on the side of caution — a 45% CRISIS
-# probability still warrants a supportive response even if the model is not
-# fully certain.
 # ─────────────────────────────────────────────────────────────────────────────
-CONFIDENCE_THRESHOLD = 0.60         # General gate: must exceed 60% to act
-CRISIS_CONFIDENCE_THRESHOLD = 0.40  # Lower gate for CRISIS — safety first
+CONFIDENCE_THRESHOLD = 0.60
+CRISIS_CONFIDENCE_THRESHOLD = 0.40
 
 
-def predict_with_confidence(features_scaled: np.ndarray) -> tuple:
+# ─────────────────────────────────────────────────────────────────────────────
+# TUNED MODEL CONFIGURATION
+# Final selected model from evaluation:
+# - Balanced synthetic dataset (1000 samples)
+# - Feature engineering (9 features total)
+# - Hyperparameter-tuned Random Forest
+# - Crisis-sensitive weighting retained for safety
+# ─────────────────────────────────────────────────────────────────────────────
+CLASS_NAMES = ["CRISIS", "ACADEMIC", "MOTIVATION", "NEUTRAL"]
+STATE_MAP = {0: "CRISIS", 1: "ACADEMIC", 2: "MOTIVATION", 3: "NEUTRAL"}
+
+BEST_CRISIS_WEIGHT = 2.5
+BEST_RF_PARAMS = {
+    "n_estimators": 200,
+    "max_depth": 8,
+    "min_samples_leaf": 3,
+    "min_samples_split": 6,
+    "max_features": "sqrt",
+    "random_state": 42,
+    "class_weight": "balanced",
+}
+
+N_PER_CLASS = 250
+NOISE_RATE = 0.04
+
+FEATURE_NAMES = [
+    "Mood",
+    "PendingTasks",
+    "HourOfDay",
+    "CompletionRate",
+    "TaskPressure",
+    "LateNight",
+    "LowMood",
+    "LowMoodHighCompletion",
+    "LowMoodHighPending",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE ENGINEERING
+# ─────────────────────────────────────────────────────────────────────────────
+def add_engineered_features(X_input: np.ndarray) -> np.ndarray:
     """
-    Option A — Confidence-gated prediction.
+    Input columns:
+    0 = Mood
+    1 = PendingTasks
+    2 = HourOfDay
+    3 = CompletionRate
 
-    Returns (state_id, confidence, explanation_str).
-    If confidence is below threshold the system defaults to NEUTRAL (state 3).
-    CRISIS uses a lower threshold (CRISIS_CONFIDENCE_THRESHOLD) because
-    under-detecting a crisis is more harmful than over-detecting one.
+    Output:
+    Original 4 features + 5 engineered features
     """
+    mood = X_input[:, 0]
+    pending = X_input[:, 1]
+    hour = X_input[:, 2]
+    completion = X_input[:, 3]
+
+    task_pressure = pending * (1 - completion)
+    late_night = ((hour >= 22) | (hour <= 4)).astype(int)
+    low_mood = (mood <= 3).astype(int)
+    low_mood_high_completion = ((mood <= 3) & (completion >= 0.8)).astype(int)
+    low_mood_high_pending = ((mood <= 3) & (pending >= 6)).astype(int)
+
+    return np.column_stack([
+        X_input,
+        task_pressure,
+        late_night,
+        low_mood,
+        low_mood_high_completion,
+        low_mood_high_pending,
+    ])
+
+
+def transform_context_vector(context_vector: list[float]) -> np.ndarray:
+    """
+    Converts raw 4D context vector into engineered 9D scaled feature vector.
+    """
+    raw = np.array([context_vector], dtype=float)
+    engineered = add_engineered_features(raw)
+    return scaler.transform(engineered)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SYNTHETIC TRAINING DATA GENERATOR
+# Mirrors the balanced evaluation dataset used for model selection.
+# ─────────────────────────────────────────────────────────────────────────────
+def clip_row(mood, pending, hour, completion):
+    mood = int(np.clip(round(mood), 1, 10))
+    pending = int(np.clip(round(pending), 0, 10))
+    hour = int(np.clip(round(hour), 0, 23))
+    completion = float(np.clip(completion, 0.0, 1.0))
+    return [mood, pending, hour, completion]
+
+
+def sample_crisis():
+    mode = np.random.choice(
+        ["classic", "high_completion", "borderline", "ambiguous"],
+        p=[0.45, 0.22, 0.23, 0.10]
+    )
+
+    if mode == "classic":
+        mood = np.random.normal(2.3, 1.1)
+        pending = np.random.normal(6.6, 2.0)
+        hour = np.random.normal(15, 5)
+        completion = np.random.normal(0.24, 0.16)
+    elif mode == "high_completion":
+        mood = np.random.normal(2.5, 1.0)
+        pending = np.random.normal(1.6, 1.2)
+        hour = np.random.normal(13, 4)
+        completion = np.random.normal(0.84, 0.09)
+    elif mode == "borderline":
+        mood = np.random.normal(3.6, 1.0)
+        pending = np.random.normal(4.8, 1.8)
+        hour = np.random.normal(14, 4)
+        completion = np.random.normal(0.46, 0.14)
+    else:
+        mood = np.random.normal(4.0, 0.9)
+        pending = np.random.normal(3.8, 1.8)
+        hour = np.random.normal(14, 4)
+        completion = np.random.normal(0.54, 0.12)
+
+    return clip_row(mood, pending, hour, completion)
+
+
+def sample_academic():
+    mode = np.random.choice(
+        ["classic", "borderline_low", "borderline_neutral", "ambiguous"],
+        p=[0.50, 0.20, 0.20, 0.10]
+    )
+
+    if mode == "classic":
+        mood = np.random.normal(5.1, 1.1)
+        pending = np.random.normal(6.8, 1.8)
+        hour = np.random.normal(13, 3.5)
+        completion = np.random.normal(0.30, 0.12)
+    elif mode == "borderline_low":
+        mood = np.random.normal(4.3, 1.0)
+        pending = np.random.normal(5.7, 1.6)
+        hour = np.random.normal(14, 3.5)
+        completion = np.random.normal(0.37, 0.12)
+    elif mode == "borderline_neutral":
+        mood = np.random.normal(5.4, 1.0)
+        pending = np.random.normal(4.4, 1.6)
+        hour = np.random.normal(14, 4)
+        completion = np.random.normal(0.44, 0.12)
+    else:
+        mood = np.random.normal(5.8, 1.0)
+        pending = np.random.normal(3.6, 1.6)
+        hour = np.random.normal(14, 4)
+        completion = np.random.normal(0.49, 0.12)
+
+    return clip_row(mood, pending, hour, completion)
+
+
+def sample_motivation():
+    mode = np.random.choice(
+        ["classic", "borderline", "near_neutral", "ambiguous"],
+        p=[0.50, 0.20, 0.20, 0.10]
+    )
+
+    if mode == "classic":
+        mood = np.random.normal(8.0, 1.0)
+        pending = np.random.normal(1.7, 1.1)
+        hour = np.random.normal(15, 4)
+        completion = np.random.normal(0.82, 0.09)
+    elif mode == "borderline":
+        mood = np.random.normal(7.0, 1.0)
+        pending = np.random.normal(2.4, 1.2)
+        hour = np.random.normal(14, 4)
+        completion = np.random.normal(0.69, 0.10)
+    elif mode == "near_neutral":
+        mood = np.random.normal(6.6, 1.0)
+        pending = np.random.normal(2.8, 1.3)
+        hour = np.random.normal(14, 4)
+        completion = np.random.normal(0.61, 0.10)
+    else:
+        mood = np.random.normal(6.2, 1.0)
+        pending = np.random.normal(3.1, 1.4)
+        hour = np.random.normal(14, 4)
+        completion = np.random.normal(0.56, 0.11)
+
+    return clip_row(mood, pending, hour, completion)
+
+
+def sample_neutral():
+    mode = np.random.choice(
+        ["classic", "low_side", "high_side", "ambiguous"],
+        p=[0.45, 0.20, 0.20, 0.15]
+    )
+
+    if mode == "classic":
+        mood = np.random.normal(5.8, 1.0)
+        pending = np.random.normal(2.2, 1.3)
+        hour = np.random.normal(14, 4)
+        completion = np.random.normal(0.52, 0.10)
+    elif mode == "low_side":
+        mood = np.random.normal(4.9, 1.0)
+        pending = np.random.normal(3.4, 1.5)
+        hour = np.random.normal(14, 4)
+        completion = np.random.normal(0.45, 0.11)
+    elif mode == "high_side":
+        mood = np.random.normal(6.8, 0.9)
+        pending = np.random.normal(2.1, 1.3)
+        hour = np.random.normal(15, 4)
+        completion = np.random.normal(0.60, 0.10)
+    else:
+        mood = np.random.normal(5.7, 1.0)
+        pending = np.random.normal(3.0, 1.5)
+        hour = np.random.normal(14, 4)
+        completion = np.random.normal(0.54, 0.11)
+
+    return clip_row(mood, pending, hour, completion)
+
+
+def generate_balanced_synthetic_dataset(seed: int = 42):
+    np.random.seed(seed)
+
+    X_list = []
+    y_list = []
+
+    for _ in range(N_PER_CLASS):
+        X_list.append(sample_crisis())
+        y_list.append(0)
+
+    for _ in range(N_PER_CLASS):
+        X_list.append(sample_academic())
+        y_list.append(1)
+
+    for _ in range(N_PER_CLASS):
+        X_list.append(sample_motivation())
+        y_list.append(2)
+
+    for _ in range(N_PER_CLASS):
+        X_list.append(sample_neutral())
+        y_list.append(3)
+
+    X_raw = np.array(X_list, dtype=float)
+    y_data = np.array(y_list, dtype=int)
+
+    n_noisy = int(len(y_data) * NOISE_RATE)
+    noise_idx = np.random.choice(len(y_data), size=n_noisy, replace=False)
+
+    nearby_class_map = {
+        0: [1, 3],
+        1: [0, 3],
+        2: [3, 1],
+        3: [1, 2],
+    }
+
+    for idx in noise_idx:
+        original = y_data[idx]
+        y_data[idx] = np.random.choice(nearby_class_map[original])
+
+    perm = np.random.permutation(len(X_raw))
+    X_raw = X_raw[perm]
+    y_data = y_data[perm]
+
+    sample_weights = np.where(y_data == 0, BEST_CRISIS_WEIGHT, 1.0)
+
+    return X_raw, y_data, sample_weights
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL INITIALIZATION
+# ─────────────────────────────────────────────────────────────────────────────
+print("🌲 Initializing MindLink tuned RF model (engineered features + tuned hyperparameters)...")
+
+scaler = StandardScaler()
+jitai_model = None
+X_accumulated_raw = []
+y_accumulated = []
+w_accumulated = []
+
+
+def fit_model_from_raw(X_raw_train, y_train, w_train) -> None:
+    """
+    Fits scaler + tuned RF on raw 4D context vectors.
+    Feature engineering is applied internally before scaling.
+    """
+    global scaler, jitai_model
+
+    X_raw_np = np.array(X_raw_train, dtype=float)
+    y_np = np.array(y_train, dtype=int)
+    w_np = np.array(w_train, dtype=float)
+
+    X_engineered = add_engineered_features(X_raw_np)
+
+    scaler = StandardScaler()
+    X_scaled_train = scaler.fit_transform(X_engineered)
+
+    jitai_model = RandomForestClassifier(**BEST_RF_PARAMS)
+    jitai_model.fit(X_scaled_train, y_np, sample_weight=w_np)
+
+
+def initialize_tuned_model() -> None:
+    global X_accumulated_raw, y_accumulated, w_accumulated
+
+    X_raw, y_data, sample_weights = generate_balanced_synthetic_dataset(seed=42)
+
+    fit_model_from_raw(X_raw, y_data, sample_weights)
+
+    X_accumulated_raw = X_raw.tolist()
+    y_accumulated = y_data.tolist()
+    w_accumulated = sample_weights.tolist()
+
+    print("✅ Tuned RandomForest Model Trained & Ready.")
+    print(f"   Training examples: {len(X_accumulated_raw)}")
+    print(f"   Engineered features: {len(FEATURE_NAMES)}")
+    print("   Feature importances:")
+    for name, importance in zip(FEATURE_NAMES, jitai_model.feature_importances_):
+        print(f"      {name:<22} = {importance:.3f}")
+    print(
+        f"   Confidence gate: general={CONFIDENCE_THRESHOLD:.0%}, "
+        f"CRISIS={CRISIS_CONFIDENCE_THRESHOLD:.0%}"
+    )
+    print(
+        f"   Tuned params: n_estimators={BEST_RF_PARAMS['n_estimators']}, "
+        f"max_depth={BEST_RF_PARAMS['max_depth']}, "
+        f"min_samples_leaf={BEST_RF_PARAMS['min_samples_leaf']}, "
+        f"min_samples_split={BEST_RF_PARAMS['min_samples_split']}, "
+        f"max_features={BEST_RF_PARAMS['max_features']}, "
+        f"crisis_weight={BEST_CRISIS_WEIGHT}"
+    )
+
+
+initialize_tuned_model()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTION A — CONFIDENCE-GATED PREDICTION
+# ─────────────────────────────────────────────────────────────────────────────
+def predict_with_confidence(context_vector: list[float]) -> tuple:
+    """
+    Returns:
+      (state_id, confidence, explanation_str)
+
+    Uses the tuned RF model over engineered features.
+    If confidence is below threshold, defaults to NEUTRAL.
+    CRISIS uses a lower threshold to prioritize safety.
+    """
+    features_scaled = transform_context_vector(context_vector)
     probabilities = jitai_model.predict_proba(features_scaled)[0]
+
     predicted_class = int(np.argmax(probabilities))
     max_confidence = float(np.max(probabilities))
 
-    state_map = {0: "CRISIS", 1: "ACADEMIC", 2: "MOTIVATION", 3: "NEUTRAL"}
-
-    # Apply class-specific confidence threshold
-    effective_threshold = CRISIS_CONFIDENCE_THRESHOLD if predicted_class == 0 else CONFIDENCE_THRESHOLD
+    effective_threshold = (
+        CRISIS_CONFIDENCE_THRESHOLD
+        if predicted_class == 0
+        else CONFIDENCE_THRESHOLD
+    )
 
     if max_confidence < effective_threshold:
         explanation = (
@@ -165,153 +464,56 @@ def predict_with_confidence(features_scaled: np.ndarray) -> tuple:
         )
         print(f"⚠️  Confidence gate triggered: {explanation}")
         return 3, max_confidence, explanation
-    else:
-        explanation = (
-            f"Confidence: {max_confidence:.0%} → {state_map[predicted_class]}. "
-            f"Probabilities: CRISIS={probabilities[0]:.2f}, ACADEMIC={probabilities[1]:.2f}, "
-            f"MOTIVATION={probabilities[2]:.2f}, NEUTRAL={probabilities[3]:.2f}"
-        )
-        print(f"✅  Prediction: {explanation}")
-        return predicted_class, max_confidence, explanation
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WARM-START DATASET
-# ─────────────────────────────────────────────────────────────────────────────
-print("🌲 Initializing Context-Aware JITAI Model (RandomForest + Options A & B)...")
-
-scaler = StandardScaler()
-
-# Feature vector: [Mood (1–10), PendingTasks (count), HourOfDay (0–23), CompletionRate (0.0–1.0)]
-# Classes: 0=CRISIS, 1=ACADEMIC, 2=MOTIVATION, 3=NEUTRAL
-X_warmup = [
-    # ── CRISIS (0) ────────────────────────────────────────────────────────────
-    [1, 8, 23, 0.1],
-    [2, 6,  1, 0.2],
-    [3, 10, 22, 0.0],
-    [2,  4,  0, 0.3],
-    [1,  2, 20, 0.9],   # KEY: very low mood + HIGH completion -> still CRISIS
-    [2,  1, 14, 0.95],  # KEY: very low mood + daytime + near-complete -> CRISIS
-    [3,  0, 12, 1.0],   # KEY: low mood + ALL tasks done -> still CRISIS
-    [1,  5, 10, 0.8],   # KEY: very low mood + high completion -> CRISIS
-    # ── ACADEMIC (1) ──────────────────────────────────────────────────────────
-    [5,  7, 12, 0.2],
-    [6, 10, 14, 0.4],
-    [4,  5, 11, 0.1],
-    [7,  8, 16, 0.3],
-    [5,  6,  9, 0.25],
-    [6,  9, 13, 0.35],
-    # ── MOTIVATION (2) ────────────────────────────────────────────────────────
-    [8,  2, 10, 0.8],
-    [9,  1, 18, 0.9],
-    [10, 0, 15, 1.0],
-    [8,  3, 20, 0.7],
-    [9,  2, 11, 0.85],
-    [7,  1, 16, 0.9],
-    # ── NEUTRAL (3) ───────────────────────────────────────────────────────────
-    [5,  0, 12, 0.5],
-    [6,  1, 21, 0.5],
-    [7,  0,  9, 0.6],
-    [4,  2, 17, 0.4],
-    [6,  0, 15, 0.55],
-    [5,  1, 19, 0.45],
-]
-
-y_warmup = [
-    0, 0, 0, 0, 0, 0, 0, 0,   # CRISIS  (8 examples)
-    1, 1, 1, 1, 1, 1,          # ACADEMIC (6 examples)
-    2, 2, 2, 2, 2, 2,          # MOTIVATION (6 examples)
-    3, 3, 3, 3, 3, 3,          # NEUTRAL (6 examples)
-]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OPTION B — CLINICALLY-INFORMED SAMPLE WEIGHTING
-# ─────────────────────────────────────────────────────────────────────────────
-sample_weights_warmup = [
-    3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0,  # CRISIS: 3x clinical weight
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0,              # ACADEMIC: standard
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0,              # MOTIVATION: standard
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0,              # NEUTRAL: standard
-]
-
-scaler.fit(X_warmup)
-X_scaled = scaler.transform(X_warmup)
-
-jitai_model = RandomForestClassifier(
-    n_estimators=100,
-    max_depth=5,
-    random_state=42,
-    class_weight="balanced"
-)
-jitai_model.fit(X_scaled, y_warmup, sample_weight=sample_weights_warmup)
-
-X_accumulated = list(X_scaled)
-y_accumulated = list(y_warmup)
-w_accumulated = list(sample_weights_warmup)
-
-print("✅ RandomForest Model Trained & Ready (Option A + Option B active).")
-print(f"   Feature importances -> "
-      f"Mood={jitai_model.feature_importances_[0]:.3f}, "
-      f"Pending={jitai_model.feature_importances_[1]:.3f}, "
-      f"Hour={jitai_model.feature_importances_[2]:.3f}, "
-      f"Completion={jitai_model.feature_importances_[3]:.3f}")
-print(f"   Confidence gate: general={CONFIDENCE_THRESHOLD:.0%}, "
-      f"CRISIS={CRISIS_CONFIDENCE_THRESHOLD:.0%}")
+    explanation = (
+        f"Confidence: {max_confidence:.0%} → {STATE_MAP[predicted_class]}. "
+        f"Probabilities: CRISIS={probabilities[0]:.2f}, ACADEMIC={probabilities[1]:.2f}, "
+        f"MOTIVATION={probabilities[2]:.2f}, NEUTRAL={probabilities[3]:.2f}"
+    )
+    print(f"✅ Prediction: {explanation}")
+    return predicted_class, max_confidence, explanation
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JITAI STATE-ADAPTIVE SYSTEM PROMPTS (RC2)
 # ─────────────────────────────────────────────────────────────────────────────
 STATE_SYSTEM_PROMPTS = {
-    "CRISIS": """You are Sage, the MindLink AI companion. The system has detected that this \
-user is in a HIGH-STRESS or CRISIS state (low mood score, high task load, or late-night check-in).
+    "CRISIS": """You are Sage, the MindLink AI companion. The system has detected that this user is in a HIGH-STRESS or CRISIS state (low mood score, high task load, or late-night check-in).
 
 Your ONLY goals right now are:
 1. Acknowledge their feelings warmly and without judgement. Do NOT minimise what they are feeling.
 2. Use brief, calming language. Short sentences. No lists or bullet points.
 3. Gently ask ONE open question to help them feel heard (e.g. "What's weighing on you most right now?").
-4. If they express any self-harm ideation, immediately respond with: \
-"I hear you. Please reach out to a crisis line right now — you don't have to face this alone. \
-In Sri Lanka: 1926 (Sumithrayo). You matter."
+4. If they express any self-harm ideation, immediately respond with: "I hear you. Please reach out to a crisis line right now — you don't have to face this alone. In Sri Lanka: 1926 (Sumithrayo). You matter."
 5. Do NOT offer productivity advice, task suggestions, or solutions. This is not the time.
 6. Keep your response under 60 words. Warmth over information.""",
 
-    "ACADEMIC": """You are Sage, the MindLink AI companion. The system has detected that this \
-user is in an ACADEMIC PRESSURE state (multiple pending tasks, daytime hours, moderate mood).
+    "ACADEMIC": """You are Sage, the MindLink AI companion. The system has detected that this user is in an ACADEMIC PRESSURE state (multiple pending tasks, daytime hours, moderate mood).
 
 Your goals:
 1. Be calm, structured, and gently motivating — like a supportive study partner.
-2. Help the user break down their workload. If they mention a task, suggest ONE concrete \
-first step using the Pomodoro principle (e.g. "Try 25 minutes on X first — what would \
-make that feel manageable?").
+2. Help the user break down their workload. If they mention a task, suggest ONE concrete first step using the Pomodoro principle (e.g. "Try 25 minutes on X first — what would make that feel manageable?").
 3. Acknowledge stress briefly but pivot quickly to actionable support.
-4. You may reference their task planner ("Have you checked your planner?") to encourage \
-engagement with the productivity features.
+4. You may reference their task planner ("Have you checked your planner?") to encourage engagement with the productivity features.
 5. Keep responses concise and structured. Maximum 80 words.
 6. Tone: focused, warm, practical. Like a calm librarian who believes in them.""",
 
-    "MOTIVATION": """You are Sage, the MindLink AI companion. The system has detected that this \
-user is in a HIGH MOTIVATION state (elevated mood, strong task completion rate, positive momentum).
+    "MOTIVATION": """You are Sage, the MindLink AI companion. The system has detected that this user is in a HIGH MOTIVATION state (elevated mood, strong task completion rate, positive momentum).
 
 Your goals:
 1. Match their energy — be enthusiastic and celebratory without being over the top.
-2. Reinforce their self-efficacy. Use specific affirmations tied to what they've accomplished \
-(e.g. "Finishing tasks consistently is a real skill — that's not nothing.").
-3. Help them think ambitiously. Ask what they want to tackle next or what goal they are \
-working toward.
-4. This is a great moment for light goal-setting or reflection (e.g. "What would make \
-today a 10/10?").
+2. Reinforce their self-efficacy. Use specific affirmations tied to what they've accomplished (e.g. "Finishing tasks consistently is a real skill — that's not nothing.").
+3. Help them think ambitiously. Ask what they want to tackle next or what goal they are working toward.
+4. This is a great moment for light goal-setting or reflection (e.g. "What would make today a 10/10?").
 5. Keep responses upbeat and forward-looking. Maximum 80 words.
 6. Tone: energising, genuine, like a coach who just saw them win.""",
 
-    "NEUTRAL": """You are Sage, the MindLink AI companion. The user is in a BASELINE / NEUTRAL \
-state — no acute stress, no crisis, no particular academic pressure.
+    "NEUTRAL": """You are Sage, the MindLink AI companion. The user is in a BASELINE / NEUTRAL state — no acute stress, no crisis, no particular academic pressure.
 
 Your goals:
 1. Be warm, curious, and open-ended. Let the user set the direction of the conversation.
 2. Do not push any agenda. Do not suggest tasks or productivity tools unless the user asks.
-3. If the user seems to want to talk, reflect their feelings back gently using active listening \
-(e.g. "It sounds like you're feeling... Is that right?").
+3. If the user seems to want to talk, reflect their feelings back gently using active listening (e.g. "It sounds like you're feeling... Is that right?").
 4. If the user asks for help with something specific, assist naturally and helpfully.
 5. Keep responses conversational. Maximum 80 words.
 6. Tone: like a calm, trustworthy friend who has time to listen."""
@@ -357,9 +559,11 @@ def get_user_context(user_id: int, db: Session):
     completion_rate = (completed / total) if total > 0 else 0.5
 
     current_hour = get_local_hour()
-    print(f"   → context vector: [{mood}, {pending}, {current_hour}, {completion_rate:.3f}]")
+    context_vector = [mood, pending, current_hour, completion_rate]
 
-    return [mood, pending, current_hour, completion_rate]
+    print(f"   → raw context vector: {context_vector}")
+
+    return context_vector
 
 
 def check_rate_limit(user_id: int, limit_seconds: int = 2) -> bool:
@@ -371,27 +575,24 @@ def check_rate_limit(user_id: int, limit_seconds: int = 2) -> bool:
     return True
 
 
-def retrain_model(X_train: list, y_train: list, w_train: list) -> None:
+def retrain_model(X_raw_train: list, y_train: list, w_train: list) -> None:
     """
-    RC1 — Batch retraining with Option B sample weights preserved.
+    RC1 — Batch retraining using the tuned RF architecture.
+    Retraining is done from raw 4D context vectors so that:
+    - engineered features are regenerated consistently
+    - scaler is refit correctly
+    - model remains aligned with the tuned backend pipeline
     """
-    global jitai_model
     if len(set(y_train)) < 2:
         print("⚠️ Skipping retrain — fewer than 2 classes in training data.")
         return
-    jitai_model = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=5,
-        random_state=42,
-        class_weight="balanced"
-    )
-    jitai_model.fit(X_train, y_train, sample_weight=w_train)
-    print(f"🔄 Model retrained on {len(X_train)} examples (Option B weights applied).")
-    print(f"   Feature importances -> "
-          f"Mood={jitai_model.feature_importances_[0]:.3f}, "
-          f"Pending={jitai_model.feature_importances_[1]:.3f}, "
-          f"Hour={jitai_model.feature_importances_[2]:.3f}, "
-          f"Completion={jitai_model.feature_importances_[3]:.3f}")
+
+    fit_model_from_raw(X_raw_train, y_train, w_train)
+
+    print(f"🔄 Tuned RF retrained on {len(X_raw_train)} examples.")
+    print("   Updated feature importances:")
+    for name, importance in zip(FEATURE_NAMES, jitai_model.feature_importances_):
+        print(f"      {name:<22} = {importance:.3f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -528,11 +729,15 @@ def update_task_status(task_id: int, update: TaskUpdate, db: Session = Depends(g
 def chat_with_ai(request: ChatRequest, db: Session = Depends(get_db)):
     # 1. Rate limiting
     if not check_rate_limit(request.user_id):
-        return {"response": "Please wait a moment before sending another message.", "alert": False, "intervention": "RATE_LIMITED"}
+        return {
+            "response": "Please wait a moment before sending another message.",
+            "alert": False,
+            "intervention": "RATE_LIMITED"
+        }
 
     user_message = request.message.strip()
 
-    # 2. ── RC3: DETERMINISTIC SAFETY BYPASS ──────────────────────────────────
+    # 2. RC3 — DETERMINISTIC SAFETY BYPASS
     critical_triggers = [
         "suicide", "kill myself", "want to die", "end my life",
         "hurt myself", "hurting myself", "harm myself", "harming myself",
@@ -551,7 +756,7 @@ def chat_with_ai(request: ChatRequest, db: Session = Depends(get_db)):
             "intervention": "CRITICAL_SELF_HARM"
         }
 
-    # 3. Save user message to chat history
+    # 3. Save user message
     db.add(models.ChatHistory(
         user_id=request.user_id,
         role="user",
@@ -560,7 +765,7 @@ def chat_with_ai(request: ChatRequest, db: Session = Depends(get_db)):
     ))
     db.commit()
 
-    # 4. Fetch last 6 messages for LLM memory window
+    # 4. Fetch recent chat history
     recent_history = (
         db.query(models.ChatHistory)
         .filter(models.ChatHistory.user_id == request.user_id)
@@ -570,16 +775,12 @@ def chat_with_ai(request: ChatRequest, db: Session = Depends(get_db)):
     )
     recent_history = recent_history[::-1]
 
-    # 5. ── RC2: COMPUTE 4D CONTEXT VECTOR ────────────────────────────────────
+    # 5. Compute live context and tuned model prediction
     context_vector = get_user_context(request.user_id, db)
-    features_scaled = scaler.transform([context_vector])
+    state_id, confidence, confidence_explanation = predict_with_confidence(context_vector)
+    current_state = STATE_MAP.get(state_id, "NEUTRAL")
 
-    state_id, confidence, confidence_explanation = predict_with_confidence(features_scaled)
-
-    state_map = {0: "CRISIS", 1: "ACADEMIC", 2: "MOTIVATION", 3: "NEUTRAL"}
-    current_state = state_map.get(state_id, "NEUTRAL")
-
-    # 6. Select state-adaptive system prompt
+    # 6. Select state-adaptive prompt
     system_prompt = STATE_SYSTEM_PROMPTS.get(current_state, STATE_SYSTEM_PROMPTS["NEUTRAL"])
 
     mood, pending, hour, completion_rate = context_vector
@@ -588,6 +789,7 @@ def chat_with_ai(request: ChatRequest, db: Session = Depends(get_db)):
         f"\nMood score: {mood}/10 | Pending tasks: {pending} | "
         f"Hour: {hour}:00 | Completion rate: {completion_rate:.0%}"
         f"\nDetected state: {current_state} (confidence: {confidence:.0%})"
+        f"\nDecision note: {confidence_explanation}"
     )
 
     messages_payload = [{"role": "system", "content": system_prompt}]
@@ -632,21 +834,26 @@ def chat_with_ai(request: ChatRequest, db: Session = Depends(get_db)):
                 "intervention": intervention,
                 "state": current_state,
                 "confidence": round(confidence, 3),
-                "context_vector": context_vector
+                "context_vector": context_vector,
+                "confidence_explanation": confidence_explanation,
             }
 
     except Exception as e:
         print(f"Groq API error: {e}")
 
-    return {"response": "I'm having trouble thinking right now. Please try again in a moment.", "alert": False, "intervention": "ERROR"}
+    return {
+        "response": "I'm having trouble thinking right now. Please try again in a moment.",
+        "alert": False,
+        "intervention": "ERROR"
+    }
 
 
 @app.get("/jitai/{user_id}")
 def get_jitai_intervention(user_id: int, db: Session = Depends(get_db)):
     """
-    RC2 — Context-aware JITAI delivery with Option A confidence gating.
+    RC2 — Context-aware JITAI delivery with tuned RF + engineered features.
     """
-    cooldown_minutes = 15  # Set to 1 for testing, 15 for production
+    cooldown_minutes = 15
     last_event = (
         db.query(models.JitaiEvent)
         .filter(models.JitaiEvent.user_id == user_id)
@@ -658,10 +865,8 @@ def get_jitai_intervention(user_id: int, db: Session = Depends(get_db)):
         now = datetime.now(last_event.created_at.tzinfo) if last_event.created_at.tzinfo else datetime.now()
         if (now - last_event.created_at) < timedelta(minutes=cooldown_minutes):
             context_vector = get_user_context(user_id, db)
-            features_scaled = scaler.transform([context_vector])
-            state_id, confidence, _ = predict_with_confidence(features_scaled)
-            state_map = {0: "CRISIS", 1: "ACADEMIC", 2: "MOTIVATION", 3: "NONE"}
-            current_type = state_map.get(state_id, "NONE")
+            state_id, confidence, _ = predict_with_confidence(context_vector)
+            current_type = {0: "CRISIS", 1: "ACADEMIC", 2: "MOTIVATION", 3: "NONE"}.get(state_id, "NONE")
             return {
                 "type": "NONE",
                 "message": "",
@@ -671,13 +876,9 @@ def get_jitai_intervention(user_id: int, db: Session = Depends(get_db)):
             }
 
     context_vector = get_user_context(user_id, db)
-    features_scaled = scaler.transform([context_vector])
+    state_id, confidence, confidence_explanation = predict_with_confidence(context_vector)
 
-    state_id, confidence, confidence_explanation = predict_with_confidence(features_scaled)
-
-    state_map = {0: "CRISIS", 1: "ACADEMIC", 2: "MOTIVATION", 3: "NONE"}
-    jitai_type = state_map.get(state_id, "NONE")
-
+    jitai_type = {0: "CRISIS", 1: "ACADEMIC", 2: "MOTIVATION", 3: "NONE"}.get(state_id, "NONE")
     if state_id == 3:
         jitai_type = "NONE"
 
@@ -700,8 +901,10 @@ def get_jitai_intervention(user_id: int, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(event)
 
-    print(f"📢 JITAI event created: type={jitai_type}, confidence={confidence:.0%}, "
-          f"event_id={event.id}")
+    print(
+        f"📢 JITAI event created: type={jitai_type}, confidence={confidence:.0%}, "
+        f"event_id={event.id}"
+    )
 
     return {
         "type": jitai_type,
@@ -716,9 +919,10 @@ def get_jitai_intervention(user_id: int, db: Session = Depends(get_db)):
 @app.post("/jitai/feedback")
 def record_feedback(data: Feedback, db: Session = Depends(get_db)):
     """
-    RC1 — Adaptive Feedback Loop with Option B weight preservation.
+    RC1 — Adaptive feedback loop with tuned RF retraining.
+    Stores raw 4D context and regenerates engineered features during retrain.
     """
-    global X_accumulated, y_accumulated, w_accumulated
+    global X_accumulated_raw, y_accumulated, w_accumulated
 
     event = db.query(models.JitaiEvent).filter(models.JitaiEvent.id == data.event_id).first()
     if not event:
@@ -728,33 +932,41 @@ def record_feedback(data: Feedback, db: Session = Depends(get_db)):
     db.commit()
 
     context_vector = json.loads(event.context_json)
-    features_scaled = scaler.transform([context_vector])
     predicted_state = int(event.state_id)
 
     if data.outcome == 1:
-        weight = 3.0 if predicted_state == 0 else 1.0
-        X_accumulated.append(features_scaled[0].tolist())
-        y_accumulated.append(predicted_state)
-        w_accumulated.append(weight)
         trained_toward = predicted_state
-        print(f"✅ Feedback: reinforcing state {predicted_state} "
-              f"(weight={weight}) for context {context_vector}")
-    else:
-        weight = 2.0 if predicted_state == 0 else 1.0
-        X_accumulated.append(features_scaled[0].tolist())
-        y_accumulated.append(3)  # NEUTRAL
-        w_accumulated.append(weight)
-        trained_toward = 3
-        print(f"⚠️ Feedback: nudging toward NEUTRAL "
-              f"(weight={weight}) for context {context_vector}")
+        weight = BEST_CRISIS_WEIGHT if trained_toward == 0 else 1.0
 
-    retrain_model(X_accumulated, y_accumulated, w_accumulated)
+        X_accumulated_raw.append(context_vector)
+        y_accumulated.append(trained_toward)
+        w_accumulated.append(weight)
+
+        print(
+            f"✅ Feedback: reinforcing state {trained_toward} "
+            f"(weight={weight}) for raw context {context_vector}"
+        )
+    else:
+        trained_toward = 3  # NEUTRAL
+        weight = 1.0
+
+        X_accumulated_raw.append(context_vector)
+        y_accumulated.append(trained_toward)
+        w_accumulated.append(weight)
+
+        print(
+            f"⚠️ Feedback: nudging toward NEUTRAL "
+            f"(weight={weight}) for raw context {context_vector}"
+        )
+
+    retrain_model(X_accumulated_raw, y_accumulated, w_accumulated)
 
     return {
-        "status": "Model Retrained",
+        "status": "Tuned Model Retrained",
         "event_id": event.id,
         "outcome": event.outcome,
         "trained_toward": trained_toward,
-        "total_training_examples": len(X_accumulated),
-        "crisis_weight_applied": weight if predicted_state == 0 else None,
+        "total_training_examples": len(X_accumulated_raw),
+        "crisis_weight_applied": weight if trained_toward == 0 else None,
+        "model_type": "Tuned RandomForest + engineered features",
     }
